@@ -5,6 +5,8 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"strings"
+	"os/exec"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
@@ -66,7 +68,6 @@ func main() {
 func handleHome(w http.ResponseWriter, _ *http.Request) {
 	var config = client.GetOAuth2Config()
 	config.RedirectURL = "http://localhost:4445/callback"
-	config.Scopes = []string{"offline", "openid"}
 
 	var authURL = client.GetOAuth2Config().AuthCodeURL(state) + "&nonce=" + state
 	renderTemplate(w, "home.html", authURL)
@@ -100,60 +101,37 @@ func handleConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apparently, the user is logged in. Now we check if we received POST
-	// request, or a GET request.
-	if r.Method == "POST" {
-		// Ok, apparently the user gave their consent!
+	// Apparently, the user is logged in. Now we create a grantedScopes object, and then POST it to the auth endpoint of hydra.
 
-		// Parse the HTTP form - required by Go.
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, errors.Wrap(err, "Could not parse form").Error(), http.StatusBadRequest)
-			return
-		}
+	// Ok, now we accept the consent request.
+	response, err = client.AcceptOAuth2ConsentRequest(consentRequestID, swagger.ConsentRequestAcceptance{
+		// The subject is a string, usually the user id.
+		Subject: user,
 
-		// Let's check which scopes the user granted.
-		var grantedScopes = []string{}
-		for key := range r.PostForm {
-			// And add each scope to the list of granted scopes.
-			grantedScopes = append(grantedScopes, key)
-		}
+		// The scopes our user granted.
+		// GrantScopes: grantedScopes,
 
-		// Ok, now we accept the consent request.
-		response, err := client.AcceptOAuth2ConsentRequest(consentRequestID, swagger.ConsentRequestAcceptance{
-			// The subject is a string, usually the user id.
-			Subject: user,
+		// Data that will be available on the token introspection and warden endpoints.
+		AccessTokenExtra: map[string]interface{}{"foo": "bar"},
 
-			// The scopes our user granted.
-			GrantScopes: grantedScopes,
-
-			// Data that will be available on the token introspection and warden endpoints.
-			AccessTokenExtra: map[string]interface{}{"foo": "bar"},
-
-			// If we issue an ID token, we can set extra data for that id token here.
-			IdTokenExtra: map[string]interface{}{"foo": "baz"},
-		})
-		if err != nil {
-			http.Error(w, errors.Wrap(err, "The accept consent request endpoint encountered a network error").Error(), http.StatusInternalServerError)
-			return
-		} else if response.StatusCode != http.StatusNoContent {
-			http.Error(w, errors.Wrapf(err, "Accept consent request endpoint gave status code %d but expected %d", response.StatusCode, http.StatusNoContent).Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Redirect the user back to hydra, and append the consent response! If the user denies request you can
-		// either handle the error in the authentication endpoint, or redirect the user back to the original application
-		// with:
-		//
-		//   response, err := client.RejectOAuth2ConsentRequest(consentRequestId, payload)
-		http.Redirect(w, r, consentRequest.RedirectUrl, http.StatusFound)
+		// If we issue an ID token, we can set extra data for that id token here.
+		IdTokenExtra: map[string]interface{}{"foo": "baz"},
+	})
+	if err != nil {
+		http.Error(w, errors.Wrap(err, "The accept consent request endpoint encountered a network error").Error(), http.StatusInternalServerError)
+		return
+	} else if response.StatusCode != http.StatusNoContent {
+		http.Error(w, errors.Wrapf(err, "Accept consent request endpoint gave status code %d but expected %d", response.StatusCode, http.StatusNoContent).Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// We received a get request, so let's show the html site where the user may give consent.
-	renderTemplate(w, "consent.html", struct {
-		*swagger.OAuth2ConsentRequest
-		ConsentRequestID string
-	}{OAuth2ConsentRequest: consentRequest, ConsentRequestID: consentRequestID})
+	// Redirect the user back to hydra, and append the consent response! If the user denies request you can
+	// either handle the error in the authentication endpoint, or redirect the user back to the original application
+	// with:
+	//
+	//   response, err := client.RejectOAuth2ConsentRequest(consentRequestId, payload)
+	http.Redirect(w, r, consentRequest.RedirectUrl, http.StatusFound)
+	return
 }
 
 // The user hits this endpoint if not authenticated. In this example, they can sign in with the credentials
@@ -169,16 +147,17 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Check the user's credentials
-		if r.Form.Get("username") != "buzz" || r.Form.Get("password") != "lightyear" {
-			http.Error(w, "Provided credentials are wrong, try buzz:lightyear", http.StatusBadRequest)
+
+		// Check the user's credentials using krbauth
+		if  !krbauth(r.Form.Get("username"), r.Form.Get("password")) {
+			http.Error(w, "Provided credentials are wrong", http.StatusBadRequest)
 			return
 		}
 
 		// Let's create a session where we store the user id. We can ignore errors from the session store
 		// as it will always return a session!
 		session, _ := store.Get(r, sessionName)
-		session.Values["user"] = "buzz-lightyear"
+		session.Values["user"] = r.Form.Get("username")
 
 		// Store the session in the cookie
 		if err := store.Save(r, w, session); err != nil {
@@ -243,4 +222,17 @@ func renderTemplate(w http.ResponseWriter, id string, d interface{}) bool {
 		return false
 	}
 	return true
+}
+
+// krbauth authenticates an user's kerberos credentials.
+func krbauth(username string, password string) bool {
+    cmd := exec.Command("kinit", username)
+    cmd.Stdin = strings.NewReader(password)
+    err := cmd.Run()
+
+    if err != nil {
+        return false
+    } else {
+    	return true
+    }
 }
